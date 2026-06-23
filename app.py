@@ -1,11 +1,31 @@
 import streamlit as st
 import time
 import random
+import uuid
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from faq_data import FAQ_DATA
 from faq_engine import FAQEngine
+from database import (
+    init_db, save_feedback, get_feedback_stats, get_recent_feedback,
+    get_custom_faqs, add_custom_faq, update_custom_faq, delete_custom_faq,
+    save_escalation, get_escalations, close_escalation,
+)
+
+init_db()
+
+# ── Sentiment detection (keyword-based, no API needed) ───────────────────────
+_FRUSTRATED = {
+    "angry","terrible","awful","worst","useless","hate","frustrated","ridiculous",
+    "stupid","pathetic","horrible","unacceptable","disappointed","upset","furious",
+    "disgusting","outrageous","scam","cheated","lied","fraud","broken","failed",
+    "never again","waste","rubbish","garbage","nonsense","joke",
+}
+
+def detect_sentiment(text: str) -> str:
+    words = set(text.lower().split())
+    return "frustrated" if words & _FRUSTRATED else "neutral"
 
 
 def send_verification_email(to_email: str, code: str) -> tuple:
@@ -253,13 +273,52 @@ header { visibility: hidden !important; }
 }
 .nav-tab.active { color:#3D2318; border-bottom-color:#C9967A; }
 .nav-tab:hover  { color:#5C3420; }
+
+/* Feedback buttons */
+.fb-row { display:flex; gap:8px; margin-top:6px; }
+.fb-btn {
+    display:inline-flex; align-items:center; gap:5px;
+    padding:3px 12px; border-radius:20px; font-size:0.74rem; font-weight:500;
+    border:1.5px solid #E8C9B8; background:#FAF5F0; color:#7A5540; cursor:pointer;
+    transition:background 0.12s;
+}
+.fb-btn.up   { border-color:#A8D5A2; color:#3D6B2E; background:#F0FAF0; }
+.fb-btn.down { border-color:#F5B8BC; color:#6B2028; background:#FDF0F0; }
+.fb-btn.dim  { opacity:0.4; pointer-events:none; }
+
+/* Escalation banner */
+.esc-banner {
+    background:#FFF3E0; border:1.5px solid #FFCC80;
+    border-radius:12px; padding:14px 18px; margin-top:12px;
+}
+.esc-banner-title { font-size:0.88rem; font-weight:600; color:#E65100; margin-bottom:5px; }
+.esc-banner-sub   { font-size:0.8rem; color:#BF360C; }
+
+/* Admin panel */
+.admin-faq-card {
+    background:#fff; border:1.5px solid #E8C9B8; border-radius:12px;
+    padding:14px 16px; margin-bottom:10px;
+}
+.admin-faq-q  { font-size:0.88rem; font-weight:600; color:#3D2318; margin-bottom:4px; }
+.admin-faq-a  { font-size:0.8rem; color:#5C3420; margin-bottom:6px; line-height:1.5; }
+.admin-faq-meta { font-size:0.68rem; color:#BFA89A; }
+
+/* Sentiment badge */
+.sentiment-frustrated {
+    display:inline-block; background:#FFF3E0; color:#E65100;
+    font-size:0.62rem; font-weight:600; padding:2px 8px;
+    border-radius:20px; letter-spacing:0.06em; margin-left:6px;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Engine ───────────────────────────────────────────────────────────────────────
+# ── Engine — includes custom FAQs from SQLite ─────────────────────────────────
 @st.cache_resource
 def load_engine():
-    return FAQEngine(FAQ_DATA)
+    custom = get_custom_faqs()
+    extra  = [{"category": f["category"], "question": f["question"],
+               "answer": f["answer"], "keywords": f["keywords"]} for f in custom]
+    return FAQEngine(FAQ_DATA + extra)
 
 engine = load_engine()
 
@@ -273,6 +332,13 @@ defaults = {
     "history": [],
     "pending_email": None, "verify_code": None,
     "verify_sent_at": 0, "email_send_error": None,
+    # new
+    "feedback": {},           # {message_id: 1|-1}
+    "session_id": uuid.uuid4().hex,
+    "escalation_shown": False,
+    "show_escalation": False,
+    "admin_auth": False,
+    "edit_faq_id": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -451,7 +517,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Nav tabs ──────────────────────────────────────────────────────────────────────
-tab_col1, tab_col2, tab_col3, tab_col4 = st.columns([1, 1, 1, 1])
+tab_col1, tab_col2, tab_col3, tab_col4, tab_col5 = st.columns([1, 1, 1, 1, 1])
 with tab_col1:
     if st.button("💬  Chat",      use_container_width=True, key="tab_chat"):
         st.session_state.active_tab = "Chat"
@@ -464,6 +530,9 @@ with tab_col3:
 with tab_col4:
     if st.button("👤  Account",   use_container_width=True, key="tab_acct"):
         st.session_state.active_tab = "Account"
+with tab_col5:
+    if st.button("🛠️  Admin",     use_container_width=True, key="tab_admin"):
+        st.session_state.active_tab = "Admin"
 
 st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
 
@@ -474,8 +543,8 @@ active = st.session_state.active_tab
 # ════════════════════════════════════════════════════════════════════════════════
 if active == "Chat":
 
-    # Category pills row
-    all_cats = ["All"] + engine.categories
+    # ── Category pills ────────────────────────────────────────────────────────────
+    all_cats   = ["All"] + engine.categories
     pills_html = '<div class="cat-pill-row">'
     for c in all_cats:
         is_active = (selected == c) or (c == "All" and selected == "All Categories")
@@ -484,7 +553,7 @@ if active == "Chat":
     pills_html += '</div>'
     st.markdown(pills_html, unsafe_allow_html=True)
 
-    # Welcome
+    # ── Welcome ───────────────────────────────────────────────────────────────────
     if not st.session_state.messages:
         samples = engine.sample_questions(selected, n=4)
         with st.chat_message("assistant", avatar="🛍️"):
@@ -494,76 +563,172 @@ if active == "Chat":
             for q in samples:
                 st.markdown(f"› {q}")
 
-    # Replay history
+    # ── Replay conversation history with feedback buttons ─────────────────────────
+    def _conf_badge(cat, conf):
+        color  = {"high":"#DFF0D8","medium":"#FEF3CD","low":"#F8D7DA"}.get(conf,"#EEE")
+        tcolor = {"high":"#3D6B2E","medium":"#7A5B00","low":"#6B2028"}.get(conf,"#555")
+        html = ""
+        if cat:
+            html += (f'<span style="background:#3D2318;color:#E8C9B8;font-size:0.6rem;'
+                     f'font-weight:600;letter-spacing:0.1em;text-transform:uppercase;'
+                     f'padding:2px 9px;border-radius:20px;margin-right:6px">{cat}</span>')
+        if conf not in ("none", ""):
+            html += (f'<span style="background:{color};color:{tcolor};font-size:0.6rem;'
+                     f'font-weight:600;padding:2px 8px;border-radius:20px">{conf}</span>')
+        return html
+
     for msg in st.session_state.messages:
         avatar = "👤" if msg["role"] == "user" else "🛍️"
         with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["text"])
-            if msg["role"] == "assistant" and msg.get("category"):
-                conf   = msg.get("conf_label", "")
-                cat    = msg.get("category", "")
-                color  = {"high":"#DFF0D8","medium":"#FEF3CD","low":"#F8D7DA"}.get(conf,"#EEE")
-                tcolor = {"high":"#3D6B2E","medium":"#7A5B00","low":"#6B2028"}.get(conf,"#555")
-                st.markdown(
-                    f'<span style="background:#3D2318;color:#E8C9B8;font-size:0.6rem;'
-                    f'font-weight:600;letter-spacing:0.1em;text-transform:uppercase;'
-                    f'padding:2px 9px;border-radius:20px;margin-right:6px">{cat}</span>'
-                    f'<span style="background:{color};color:{tcolor};font-size:0.6rem;'
-                    f'font-weight:600;padding:2px 8px;border-radius:20px">{conf}</span>',
-                    unsafe_allow_html=True
-                )
+            if msg["role"] == "assistant":
+                badge = _conf_badge(msg.get("category",""), msg.get("conf_label",""))
+                if badge:
+                    st.markdown(badge, unsafe_allow_html=True)
+                # Feedback buttons
+                mid = msg.get("id")
+                if mid:
+                    rated = st.session_state.feedback.get(mid)
+                    if rated is None:
+                        fc1, fc2, _ = st.columns([1, 1, 6])
+                        with fc1:
+                            if st.button("👍 Helpful", key=f"up_{mid}",
+                                         use_container_width=True):
+                                st.session_state.feedback[mid] = 1
+                                save_feedback(mid, msg.get("question",""),
+                                              msg["text"], msg.get("category",""), 1)
+                                st.rerun()
+                        with fc2:
+                            if st.button("👎 Not helpful", key=f"dn_{mid}",
+                                         use_container_width=True):
+                                st.session_state.feedback[mid] = -1
+                                save_feedback(mid, msg.get("question",""),
+                                              msg["text"], msg.get("category",""), -1)
+                                st.rerun()
+                    else:
+                        label = "👍 Marked helpful" if rated == 1 else "👎 Marked not helpful"
+                        st.markdown(f'<span style="font-size:0.72rem;color:#BFA89A">'
+                                    f'{label}</span>', unsafe_allow_html=True)
 
-    # Input
+    # ── Escalation banner (shown once per session when user is frustrated) ────────
+    total_msgs = sum(1 for m in st.session_state.messages if m["role"] == "user")
+    if (st.session_state.get("show_escalation") and
+            not st.session_state.escalation_shown):
+        st.markdown("""
+        <div class="esc-banner">
+            <div class="esc-banner-title">😟 It looks like you're having trouble</div>
+            <div class="esc-banner-sub">Would you like us to connect you with a support agent?</div>
+        </div>
+        """, unsafe_allow_html=True)
+        ec1, ec2, _ = st.columns([1, 1, 4])
+        with ec1:
+            if st.button("Yes, connect me", key="esc_yes", use_container_width=True):
+                st.session_state.active_tab      = "Escalate"
+                st.session_state.escalation_shown = True
+                st.rerun()
+        with ec2:
+            if st.button("No, I'm fine", key="esc_no", use_container_width=True):
+                st.session_state.escalation_shown = True
+                st.session_state.show_escalation  = False
+                st.rerun()
+
+    # ── Input ─────────────────────────────────────────────────────────────────────
     user_input = st.chat_input("Ask about orders, payments, delivery, returns…")
 
     if user_input and user_input.strip():
-        text = user_input.strip()
-        ts   = time.strftime("%H:%M")
+        text      = user_input.strip()
+        ts        = time.strftime("%H:%M")
+        sentiment = detect_sentiment(text)
 
         with st.chat_message("user", avatar="👤"):
             st.markdown(text)
-        st.session_state.messages.append({"role":"user","text":text,"time":ts})
+            if sentiment == "frustrated":
+                st.markdown('<span class="sentiment-frustrated">frustrated</span>',
+                            unsafe_allow_html=True)
+        st.session_state.messages.append({"role": "user", "text": text, "time": ts})
+
+        # Trigger escalation banner on frustrated sentiment
+        if sentiment == "frustrated" and not st.session_state.escalation_shown:
+            st.session_state.show_escalation = True
 
         result = engine.query(text, category=selected)
+        mid    = uuid.uuid4().hex
 
         with st.chat_message("assistant", avatar="🛍️"):
             if result["found"]:
-                st.markdown(result["answer"])
-                conf   = result["conf_label"]
-                cat    = result["category"]
-                color  = {"high":"#DFF0D8","medium":"#FEF3CD","low":"#F8D7DA"}.get(conf,"#EEE")
-                tcolor = {"high":"#3D6B2E","medium":"#7A5B00","low":"#6B2028"}.get(conf,"#555")
-                st.markdown(
-                    f'<span style="background:#3D2318;color:#E8C9B8;font-size:0.6rem;'
-                    f'font-weight:600;letter-spacing:0.1em;text-transform:uppercase;'
-                    f'padding:2px 9px;border-radius:20px;margin-right:6px">{cat}</span>'
-                    f'<span style="background:{color};color:{tcolor};font-size:0.6rem;'
-                    f'font-weight:600;padding:2px 8px;border-radius:20px">{conf}</span>',
-                    unsafe_allow_html=True
-                )
+                answer = result["answer"]
+                # Add empathy prefix for frustrated users
+                if sentiment == "frustrated":
+                    answer = "I'm sorry you're having this experience. " + answer
+                st.markdown(answer)
+                conf = result["conf_label"]
+                cat  = result["category"]
+                badge = _conf_badge(cat, conf)
+                if badge:
+                    st.markdown(badge, unsafe_allow_html=True)
+                # Inline feedback buttons for the new message
+                fc1, fc2, _ = st.columns([1, 1, 6])
+                with fc1:
+                    if st.button("👍 Helpful", key=f"up_{mid}", use_container_width=True):
+                        st.session_state.feedback[mid] = 1
+                        save_feedback(mid, text, answer, cat, 1)
+                        st.rerun()
+                with fc2:
+                    if st.button("👎 Not helpful", key=f"dn_{mid}", use_container_width=True):
+                        st.session_state.feedback[mid] = -1
+                        save_feedback(mid, text, answer, cat, -1)
+                        st.rerun()
                 st.session_state.answered += 1
-                st.session_state.history.append({
-                    "q": text, "cat": cat, "conf": conf, "time": ts
-                })
+                st.session_state.history.append({"q": text, "cat": cat, "conf": conf, "time": ts})
                 st.session_state.messages.append({
-                    "role":"assistant","text":result["answer"],"time":ts,
-                    "conf_label":conf,"category":cat,"suggestions":[],
+                    "role": "assistant", "text": answer, "time": ts,
+                    "conf_label": conf, "category": cat, "suggestions": [],
+                    "id": mid, "question": text,
                 })
             else:
                 fallback = "I couldn't find an answer for that. Try rephrasing, or pick a category."
+                if sentiment == "frustrated":
+                    fallback = ("I'm sorry for the trouble. " + fallback)
                 st.markdown(fallback)
-                sugg = result.get("suggestions",[])
+                sugg = result.get("suggestions", [])
                 if sugg:
                     st.markdown("**You might mean:**")
                     for s in sugg[:3]:
                         st.markdown(f"› {s}")
-                st.session_state.history.append({
-                    "q": text, "cat": "—", "conf": "none", "time": ts
-                })
+                st.session_state.history.append({"q": text, "cat": "—", "conf": "none", "time": ts})
                 st.session_state.messages.append({
-                    "role":"assistant","text":fallback,"time":ts,
-                    "conf_label":"none","category":"","suggestions":sugg,
+                    "role": "assistant", "text": fallback, "time": ts,
+                    "conf_label": "none", "category": "", "suggestions": sugg,
+                    "id": mid, "question": text,
                 })
+
+# ── Escalation form (inline "tab") ────────────────────────────────────────────
+elif active == "Escalate":
+    st.markdown("""
+    <div style="background:#FFF3E0;border:1.5px solid #FFCC80;border-radius:14px;
+                padding:18px 22px;margin-bottom:20px">
+        <div style="font-size:1rem;font-weight:600;color:#E65100;margin-bottom:4px">
+            🎧 Connect with a Support Agent
+        </div>
+        <div style="font-size:0.82rem;color:#BF360C">
+            Fill in your details below and our team will reach out within 2 business hours.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    esc_name  = st.text_input("Your name",  value=st.session_state.user_name,  key="esc_name")
+    esc_email = st.text_input("Your email", value=st.session_state.user_email, key="esc_email")
+    esc_issue = st.text_area("Describe your issue", height=120, key="esc_issue",
+                              placeholder="Tell us what's wrong and we'll get back to you…")
+    if st.button("Submit request", use_container_width=True, key="esc_submit"):
+        if esc_name.strip() and esc_email.strip() and esc_issue.strip():
+            save_escalation(st.session_state.session_id,
+                            esc_name.strip(), esc_email.strip(), esc_issue.strip())
+            st.success("Request submitted! Our team will contact you shortly.")
+            st.session_state.escalation_shown = True
+            st.session_state.active_tab       = "Chat"
+            st.rerun()
+        else:
+            st.error("Please fill in all fields.")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 2 — DASHBOARD
@@ -620,6 +785,40 @@ elif active == "Dashboard":
     else:
         st.markdown('<div style="color:#BFA89A;font-size:0.85rem;padding:20px 0;text-align:center">'
                     'No questions asked yet. Start chatting to see your breakdown.</div>',
+                    unsafe_allow_html=True)
+
+    # Feedback stats from SQLite
+    st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:0.72rem;font-weight:600;letter-spacing:0.1em;'
+                'text-transform:uppercase;color:#BFA89A;margin-bottom:10px">Answer feedback (all sessions)</div>',
+                unsafe_allow_html=True)
+
+    fb_stats = get_feedback_stats()
+    if fb_stats:
+        for row in fb_stats:
+            pos = row["positive"] or 0
+            neg = row["negative"] or 0
+            tot = row["total"] or 1
+            pct_pos = int(pos / tot * 100)
+            pct_neg = 100 - pct_pos
+            st.markdown(f"""
+            <div style="margin-bottom:10px">
+                <div style="display:flex;justify-content:space-between;
+                            font-size:0.78rem;color:#3D2318;margin-bottom:4px">
+                    <span>{row["category"] or "—"}</span>
+                    <span style="color:#BFA89A">
+                        👍 {pos} &nbsp; 👎 {neg} &nbsp; total {tot}
+                    </span>
+                </div>
+                <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;background:#F0DDD0">
+                    <div style="width:{pct_pos}%;background:#7CB87C"></div>
+                    <div style="width:{pct_neg}%;background:#E07070"></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.markdown('<div style="color:#BFA89A;font-size:0.85rem;padding:8px 0">'
+                    'No feedback recorded yet — rate answers with 👍/👎 in the chat.</div>',
                     unsafe_allow_html=True)
 
     # Unanswered
@@ -883,3 +1082,207 @@ elif active == "Account":
             <span style="font-size:0.82rem;font-weight:500;color:#3D2318">{value}</span>
         </div>
         """, unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 5 — ADMIN
+# ════════════════════════════════════════════════════════════════════════════════
+elif active == "Admin":
+
+    # ── Password gate ─────────────────────────────────────────────────────────────
+    if not st.session_state.admin_auth:
+        st.markdown("""
+        <div style="text-align:center;padding:30px 0 10px">
+            <div style="font-family:'Cormorant Garamond',serif;font-size:1.6rem;
+                        font-weight:600;color:#3D2318;margin-bottom:6px">Admin Panel</div>
+            <div style="font-size:0.82rem;color:#BFA89A">Enter your admin password to continue</div>
+        </div>
+        """, unsafe_allow_html=True)
+        admin_pw = st.text_input("Admin password", type="password", key="admin_pw_input",
+                                  label_visibility="collapsed",
+                                  placeholder="Admin password…")
+        if st.button("Log in", use_container_width=True, key="admin_login"):
+            expected = st.secrets.get("admin", {}).get("password", "admin123")
+            if admin_pw == expected:
+                st.session_state.admin_auth = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+
+    else:
+        # ── Header + logout ───────────────────────────────────────────────────────
+        col_ah, col_al = st.columns([5, 1])
+        with col_ah:
+            st.markdown("""
+            <div style="font-family:'Cormorant Garamond',serif;font-size:1.5rem;
+                        font-weight:600;color:#3D2318;padding-bottom:4px">
+                🛠️ Admin Panel
+            </div>""", unsafe_allow_html=True)
+        with col_al:
+            if st.button("Log out", key="admin_logout", use_container_width=True):
+                st.session_state.admin_auth = False
+                st.rerun()
+
+        st.markdown("---")
+
+        # ── Section A: Custom FAQ management ─────────────────────────────────────
+        st.markdown('<div style="font-size:0.72rem;font-weight:600;letter-spacing:0.1em;'
+                    'text-transform:uppercase;color:#BFA89A;margin-bottom:14px">Custom FAQs</div>',
+                    unsafe_allow_html=True)
+
+        custom_faqs = get_custom_faqs()
+
+        # ── Add / Edit form ───────────────────────────────────────────────────────
+        editing_id  = st.session_state.edit_faq_id
+        editing_row = next((f for f in custom_faqs if f["id"] == editing_id), None)
+
+        all_categories = sorted({f["category"] for f in FAQ_DATA})
+        form_header    = f"Edit FAQ #{editing_id}" if editing_row else "Add new FAQ"
+
+        with st.expander(form_header, expanded=(editing_id is not None)):
+            faq_cat   = st.selectbox(
+                "Category", all_categories,
+                index=all_categories.index(editing_row["category"]) if editing_row else 0,
+                key="faq_form_cat",
+            )
+            faq_q     = st.text_input(
+                "Question",
+                value=editing_row["question"] if editing_row else "",
+                key="faq_form_q",
+            )
+            faq_a     = st.text_area(
+                "Answer", height=100,
+                value=editing_row["answer"] if editing_row else "",
+                key="faq_form_a",
+            )
+            faq_kw_raw = st.text_input(
+                "Keywords (comma-separated, optional)",
+                value=", ".join(editing_row["keywords"]) if editing_row else "",
+                key="faq_form_kw",
+            )
+
+            bf1, bf2 = st.columns([1, 1])
+            with bf1:
+                save_label = "Update FAQ" if editing_row else "Add FAQ"
+                if st.button(save_label, use_container_width=True, key="faq_form_save"):
+                    if faq_q.strip() and faq_a.strip():
+                        kw_list = [k.strip() for k in faq_kw_raw.split(",") if k.strip()]
+                        if editing_row:
+                            update_custom_faq(editing_id, faq_cat, faq_q.strip(),
+                                              faq_a.strip(), kw_list)
+                            st.session_state.edit_faq_id = None
+                        else:
+                            add_custom_faq(faq_cat, faq_q.strip(), faq_a.strip(), kw_list)
+                        st.cache_resource.clear()
+                        st.toast("FAQ saved!" if not editing_row else "FAQ updated!")
+                        st.rerun()
+                    else:
+                        st.error("Question and answer are required.")
+            with bf2:
+                if editing_row:
+                    if st.button("Cancel", use_container_width=True, key="faq_form_cancel"):
+                        st.session_state.edit_faq_id = None
+                        st.rerun()
+
+        # ── List custom FAQs ──────────────────────────────────────────────────────
+        if custom_faqs:
+            for faq in custom_faqs:
+                with st.container():
+                    st.markdown(f"""
+                    <div class="admin-faq-card">
+                        <div style="font-size:0.6rem;font-weight:600;letter-spacing:0.08em;
+                                    text-transform:uppercase;color:#BFA89A;margin-bottom:4px">
+                            {faq["category"]}
+                        </div>
+                        <div style="font-size:0.88rem;font-weight:600;color:#3D2318;margin-bottom:4px">
+                            {faq["question"]}
+                        </div>
+                        <div style="font-size:0.8rem;color:#5C3420;line-height:1.5">
+                            {faq["answer"][:140]}{'…' if len(faq["answer"]) > 140 else ''}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    bc1, bc2, _ = st.columns([1, 1, 5])
+                    with bc1:
+                        if st.button("Edit", key=f"edit_faq_{faq['id']}", use_container_width=True):
+                            st.session_state.edit_faq_id = faq["id"]
+                            st.rerun()
+                    with bc2:
+                        if st.button("Delete", key=f"del_faq_{faq['id']}", use_container_width=True):
+                            delete_custom_faq(faq["id"])
+                            st.cache_resource.clear()
+                            st.toast("FAQ deleted.")
+                            st.rerun()
+        else:
+            st.markdown('<div style="color:#BFA89A;font-size:0.85rem;padding:10px 0">'
+                        'No custom FAQs yet. Use the form above to add one.</div>',
+                        unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Section B: Escalations ────────────────────────────────────────────────
+        st.markdown('<div style="font-size:0.72rem;font-weight:600;letter-spacing:0.1em;'
+                    'text-transform:uppercase;color:#BFA89A;margin-bottom:14px">Support escalations</div>',
+                    unsafe_allow_html=True)
+
+        esc_filter   = st.radio("Show", ["open", "closed", "all"],
+                                 horizontal=True, key="esc_filter_admin")
+        escalations  = get_escalations(status=None if esc_filter == "all" else esc_filter)
+
+        if escalations:
+            for esc in escalations:
+                status_color = "#DFF0D8" if esc["status"] == "closed" else "#FEF3CD"
+                status_text  = "#3D6B2E" if esc["status"] == "closed" else "#7A5B00"
+                st.markdown(f"""
+                <div style="background:#FAF5F0;border:1px solid #F0DDD0;border-radius:12px;
+                            padding:14px 18px;margin-bottom:10px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;
+                                margin-bottom:8px">
+                        <div style="font-size:0.88rem;font-weight:600;color:#3D2318">
+                            {esc["user_name"]}
+                            <span style="font-size:0.75rem;color:#BFA89A;font-weight:400;
+                                         margin-left:8px">{esc["user_email"]}</span>
+                        </div>
+                        <span style="background:{status_color};color:{status_text};font-size:0.62rem;
+                                     font-weight:600;letter-spacing:0.08em;text-transform:uppercase;
+                                     padding:2px 9px;border-radius:20px">{esc["status"]}</span>
+                    </div>
+                    <div style="font-size:0.82rem;color:#5C3420;line-height:1.5;margin-bottom:6px">
+                        {esc["issue"]}
+                    </div>
+                    <div style="font-size:0.68rem;color:#BFA89A">{esc["created_at"]}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                if esc["status"] == "open":
+                    if st.button("Mark resolved", key=f"close_esc_{esc['id']}",
+                                 use_container_width=False):
+                        close_escalation(esc["id"])
+                        st.toast("Escalation closed.")
+                        st.rerun()
+        else:
+            st.markdown('<div style="color:#BFA89A;font-size:0.85rem;padding:10px 0">'
+                        f'No {esc_filter} escalations.</div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Section C: Recent feedback ────────────────────────────────────────────
+        st.markdown('<div style="font-size:0.72rem;font-weight:600;letter-spacing:0.1em;'
+                    'text-transform:uppercase;color:#BFA89A;margin-bottom:14px">Recent feedback (last 20)</div>',
+                    unsafe_allow_html=True)
+
+        recent_fb = get_recent_feedback(20)
+        if recent_fb:
+            for fb in recent_fb:
+                icon   = "👍" if fb["rating"] == 1 else "👎"
+                border = "#DFF0D8" if fb["rating"] == 1 else "#F8D7DA"
+                st.markdown(f"""
+                <div style="background:#FAF5F0;border:1px solid {border};border-radius:10px;
+                            padding:10px 14px;margin-bottom:8px;font-size:0.8rem;color:#3D2318">
+                    <span style="font-size:1rem">{icon}</span>
+                    <span style="font-weight:600;margin:0 6px">{fb["category"] or "—"}</span>
+                    <span style="color:#BFA89A">{fb["question"][:80] if fb["question"] else ""}…</span>
+                    <span style="float:right;font-size:0.68rem;color:#BFA89A">{fb["created_at"][:16]}</span>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="color:#BFA89A;font-size:0.85rem;padding:10px 0">'
+                        'No feedback recorded yet.</div>', unsafe_allow_html=True)
