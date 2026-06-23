@@ -9,8 +9,8 @@ A production-grade NLP-powered FAQ chatbot for e-commerce support. Built with TF
 ## Live Demo
 
 ```bash
-git clone https://github.com/Rushithaborra/CodeAlpha_ChatbotForFAQs.git
-cd CodeAlpha_ChatbotForFAQs
+git clone https://github.com/Rushithaborra/ChatbotForFAQs.git
+cd ChatbotForFAQs
 pip install -r requirements.txt
 streamlit run app.py
 ```
